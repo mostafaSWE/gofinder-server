@@ -415,6 +415,7 @@ def home():
 @require_admin
 def admin_stats():
     """Return JSON statistics about collected data."""
+    stats = {}
     for table in ("reinforcement_rows", "reinforcement_entity_rows"):
         row = query_db(f"""
             SELECT
@@ -677,10 +678,10 @@ def admin_dashboard():
 
     return render_template_string(
         DASHBOARD_HTML,
-        r_stats=dict(r_stats),
-        e_stats=dict(e_stats),
-        recent_r=recent_r,
-        recent_e=recent_e,
+        r_stats=dict(r_stats) if r_stats else {},
+        e_stats=dict(e_stats) if e_stats else {},
+        recent_r=recent_r or [],
+        recent_e=recent_e or [],
     )
 
 
