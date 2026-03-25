@@ -403,6 +403,10 @@ def collect():
 def health():
     return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()}), 200
 
+@app.route("/")
+def home():
+    return "GOFinder API is running. Visit /admin/dashboard for admin panel."
+
 
 # ---------------------------------------------------------------------------
 # /admin/stats
