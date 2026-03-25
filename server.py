@@ -144,7 +144,8 @@ def query_db(query, args=(), one=False, commit=False):
             if q.strip().upper().startswith("SELECT"):
                 rv = cur.fetchall()
                 return (rv[0] if rv else None) if one else rv
-            return cur.rowcount
+                
+            return getattr(cur, "rowcount", 1)
             
     else: # sqlite3
         cur = db.execute(query, args)
@@ -358,7 +359,7 @@ def collect():
             if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
                 dupes_r += 1
             else:
-                raise
+                return jsonify({"error": "Postgres Insert Error (Reinf)", "details": str(e), "trace": repr(e)}), 500
 
     result["inserted"]["reinforcement"] = inserted_r
     result["duplicates_skipped"]["reinforcement"] = dupes_r
@@ -388,7 +389,7 @@ def collect():
             if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
                 dupes_e += 1
             else:
-                raise
+                return jsonify({"error": "Postgres Insert Error (Entity)", "details": str(e), "trace": repr(e)}), 500
 
     result["inserted"]["reinforcement_entity"] = inserted_e
     result["duplicates_skipped"]["reinforcement_entity"] = dupes_e
