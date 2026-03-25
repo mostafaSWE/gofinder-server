@@ -1,5 +1,5 @@
 """
-GOFinder AI — Reinforcement Data Collection Server
+GOFinder AI - Reinforcement Data Collection Server
 ====================================================
 A lightweight Flask server that receives, deduplicates, and stores
 reinforcement feedback uploaded by local GOFinder AI instances.
