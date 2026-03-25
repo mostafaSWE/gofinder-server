@@ -676,10 +676,18 @@ def admin_dashboard():
     recent_r = query_db("SELECT * FROM reinforcement_rows ORDER BY id DESC LIMIT 20")
     recent_e = query_db("SELECT * FROM reinforcement_entity_rows ORDER BY id DESC LIMIT 20")
 
+    r_dict = dict(r_stats) if r_stats else {}
+    if r_dict.get('earliest'):
+        r_dict['earliest'] = str(r_dict['earliest'])
+
+    e_dict = dict(e_stats) if e_stats else {}
+    if e_dict.get('earliest'):
+        e_dict['earliest'] = str(e_dict['earliest'])
+
     return render_template_string(
         DASHBOARD_HTML,
-        r_stats=dict(r_stats) if r_stats else {},
-        e_stats=dict(e_stats) if e_stats else {},
+        r_stats=r_dict,
+        e_stats=e_dict,
         recent_r=recent_r or [],
         recent_e=recent_e or [],
     )
