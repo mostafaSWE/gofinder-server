@@ -27,6 +27,7 @@ import json
 import os
 import secrets
 import sqlite3
+import traceback
 import urllib.parse
 from datetime import datetime
 from functools import wraps
@@ -306,95 +307,86 @@ def _map_row(row: dict, key_map: dict) -> dict:
 @app.route("/collect", methods=["POST"])
 @require_api_key
 def collect():
-    """
-    Receive reinforcement feedback rows from a local GOFinder instance.
+    try:
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "Invalid JSON payload"}), 400
 
-    Payload::
+        installation_id = data.get("installation_id", "unknown")
+        rows_payload = data.get("rows", {})
 
-        {
-            "installation_id": "uuid4",
-            "rows": {
-                "reinforcement": [ {row_dict}, ... ],
-                "reinforcement_entity": [ {row_dict}, ... ]
-            }
-        }
+        if not isinstance(rows_payload, dict):
+            return jsonify({"error": "'rows' must be a dict with keys 'reinforcement' and/or 'reinforcement_entity'"}), 400
 
-    Returns counts of inserted rows and skipped duplicates.
-    """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Invalid JSON payload"}), 400
+        db = get_db()
+        result = {"inserted": {}, "duplicates_skipped": {}}
 
-    installation_id = data.get("installation_id", "unknown")
-    rows_payload = data.get("rows", {})
+        # --- Reinforcement rows ---
+        reinf_rows = rows_payload.get("reinforcement", [])
+        inserted_r, dupes_r = 0, 0
+        for row in reinf_rows:
+            row_hash = _hash_row(row)
+            mapped = _map_row(row, _REINFORCEMENT_KEY_MAP)
+            mapped["row_hash"] = row_hash
+            mapped["installation_id"] = installation_id
 
-    if not isinstance(rows_payload, dict):
-        return jsonify({"error": "'rows' must be a dict with keys 'reinforcement' and/or 'reinforcement_entity'"}), 400
+            cols = ", ".join(mapped.keys())
+            placeholders = ", ".join(["?"] * len(mapped))
+            try:
+                changes = query_db(
+                    f"INSERT OR IGNORE INTO reinforcement_rows ({cols}) VALUES ({placeholders})",
+                    list(mapped.values()),
+                    commit=True
+                )
+                if changes and changes > 0:
+                    inserted_r += 1
+                else:
+                    dupes_r += 1
+            except Exception as e:
+                if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
+                    dupes_r += 1
+                else:
+                    return jsonify({"error": "Postgres Insert Error (Reinf)", "details": str(e), "trace": repr(e)}), 500
 
-    db = get_db()
-    result = {"inserted": {}, "duplicates_skipped": {}}
+        result["inserted"]["reinforcement"] = inserted_r
+        result["duplicates_skipped"]["reinforcement"] = dupes_r
 
-    # --- Reinforcement rows ---
-    reinf_rows = rows_payload.get("reinforcement", [])
-    inserted_r, dupes_r = 0, 0
-    for row in reinf_rows:
-        row_hash = _hash_row(row)
-        mapped = _map_row(row, _REINFORCEMENT_KEY_MAP)
-        mapped["row_hash"] = row_hash
-        mapped["installation_id"] = installation_id
+        # --- Entity rows ---
+        entity_rows = rows_payload.get("reinforcement_entity", [])
+        inserted_e, dupes_e = 0, 0
+        for row in entity_rows:
+            row_hash = _hash_row(row)
+            mapped = _map_row(row, _ENTITY_KEY_MAP)
+            mapped["row_hash"] = row_hash
+            mapped["installation_id"] = installation_id
 
-        cols = ", ".join(mapped.keys())
-        placeholders = ", ".join(["?"] * len(mapped))
-        try:
-            changes = query_db(
-                f"INSERT OR IGNORE INTO reinforcement_rows ({cols}) VALUES ({placeholders})",
-                list(mapped.values()),
-                commit=True
-            )
-            if changes and changes > 0:
-                inserted_r += 1
-            else:
-                dupes_r += 1
-        except Exception as e:
-            if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
-                dupes_r += 1
-            else:
-                return jsonify({"error": "Postgres Insert Error (Reinf)", "details": str(e), "trace": repr(e)}), 500
+            cols = ", ".join(mapped.keys())
+            placeholders = ", ".join(["?"] * len(mapped))
+            try:
+                changes = query_db(
+                    f"INSERT OR IGNORE INTO reinforcement_entity_rows ({cols}) VALUES ({placeholders})",
+                    list(mapped.values()),
+                    commit=True
+                )
+                if changes and changes > 0:
+                    inserted_e += 1
+                else:
+                    dupes_e += 1
+            except Exception as e:
+                if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
+                    dupes_e += 1
+                else:
+                    return jsonify({"error": "Postgres Insert Error (Entity)", "details": str(e), "trace": repr(e)}), 500
 
-    result["inserted"]["reinforcement"] = inserted_r
-    result["duplicates_skipped"]["reinforcement"] = dupes_r
+        result["inserted"]["reinforcement_entity"] = inserted_e
+        result["duplicates_skipped"]["reinforcement_entity"] = dupes_e
 
-    # --- Entity rows ---
-    entity_rows = rows_payload.get("reinforcement_entity", [])
-    inserted_e, dupes_e = 0, 0
-    for row in entity_rows:
-        row_hash = _hash_row(row)
-        mapped = _map_row(row, _ENTITY_KEY_MAP)
-        mapped["row_hash"] = row_hash
-        mapped["installation_id"] = installation_id
+        return jsonify({"status": "ok", **result}), 200
+        
+    except Exception as e:
+        return jsonify({"error": "Global crash", "details": str(e), "traceback": traceback.format_exc()}), 500
 
-        cols = ", ".join(mapped.keys())
-        placeholders = ", ".join(["?"] * len(mapped))
-        try:
-            changes = query_db(
-                f"INSERT OR IGNORE INTO reinforcement_entity_rows ({cols}) VALUES ({placeholders})",
-                list(mapped.values()),
-                commit=True
-            )
-            if changes and changes > 0:
-                inserted_e += 1
-            else:
-                dupes_e += 1
-        except Exception as e:
-            if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
-                dupes_e += 1
-            else:
-                return jsonify({"error": "Postgres Insert Error (Entity)", "details": str(e), "trace": repr(e)}), 500
 
-    result["inserted"]["reinforcement_entity"] = inserted_e
-    result["duplicates_skipped"]["reinforcement_entity"] = dupes_e
-
-    return jsonify({"status": "ok", **result}), 200
 
 
 # ---------------------------------------------------------------------------
