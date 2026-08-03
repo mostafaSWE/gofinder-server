@@ -27,7 +27,8 @@ import json
 import os
 import secrets
 import sqlite3
-import traceback
+import threading
+import time
 import urllib.parse
 from datetime import datetime
 from functools import wraps
@@ -52,6 +53,25 @@ COLLECTION_API_KEY = os.environ.get("COLLECTION_API_KEY", "changeme-api-key")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 COLLECTION_PORT = int(os.environ.get("COLLECTION_PORT", 5050))
+
+# Ingestion limits. These exist to bound abuse, not to reduce how much
+# legitimate feedback can be collected: a client that hits them is told to
+# split or retry and keeps its rows pending, so nothing is lost.
+#
+# MAX_CONTENT_LENGTH is set well above the client's own 2 MB batch budget so
+# normal uploads never touch it. A request over the limit gets 413, which the
+# client answers by halving the batch and retrying.
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(8 * 1024 * 1024)))
+MAX_ROWS_PER_REQUEST = int(os.environ.get("MAX_ROWS_PER_REQUEST", "200"))
+
+# Generous rate limit, per client IP, sized so a large backlog syncs without
+# tripping it. Set RATE_LIMIT_PER_MINUTE=0 to disable.
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "120"))
+RATE_LIMIT_RETRY_AFTER = int(os.environ.get("RATE_LIMIT_RETRY_AFTER", "60"))
+
+# The admin dashboard exposes every collected row and a CSV export, so it must
+# not run on the shipped default password.
+ADMIN_PASSWORD_IS_DEFAULT = ADMIN_PASSWORD == "changeme"
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite")
 IS_POSTGRES = DATABASE_URL.startswith("postgres")
 
@@ -99,7 +119,30 @@ ENTITY_COLUMNS = [
 # Flask app
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-CORS(app)
+
+# Only the unauthenticated health probe is exposed cross-origin. /collect is
+# called server-to-server by local GOFinder backends (no browser, no preflight)
+# and the admin pages are same-origin, so neither needs CORS.
+CORS(app, resources={r"/health": {"origins": "*"}})
+
+# Reject oversized bodies before they are buffered. Flask turns this into a 413.
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+
+if ADMIN_PASSWORD_IS_DEFAULT:
+    app.logger.warning(
+        "ADMIN_PASSWORD is unset or still the default; admin endpoints are "
+        "disabled until it is set to a real value."
+    )
+
+
+@app.errorhandler(413)
+def _payload_too_large(_e):
+    """Answer oversized uploads in the shape the client expects."""
+    return jsonify({
+        "error": "Payload too large",
+        "max_bytes": MAX_REQUEST_BYTES,
+        "hint": "Split the batch and retry; no rows were stored.",
+    }), 413
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +271,14 @@ def require_admin(f):
     """Decorator: HTTP Basic Auth for admin endpoints."""
     @wraps(f)
     def decorated(*args, **kwargs):
+        if ADMIN_PASSWORD_IS_DEFAULT:
+            # Refusing is safer than serving every collected row behind a
+            # password that is published in this repository.
+            return jsonify({
+                "error": "Admin endpoints are disabled",
+                "hint": "Set the ADMIN_PASSWORD environment variable to enable them.",
+            }), 503
+
         auth = request.authorization
         if (
             not auth
@@ -246,6 +297,34 @@ def require_admin(f):
 # ---------------------------------------------------------------------------
 # Hashing
 # ---------------------------------------------------------------------------
+_rate_buckets = {}
+_rate_lock = threading.Lock()
+
+
+def _rate_limited(client_key: str) -> bool:
+    """
+    Fixed-window counter per client, per minute.
+
+    Deliberately coarse and generous. Each gunicorn worker keeps its own
+    counter, so the effective limit is never stricter than configured — the
+    failure mode is permitting slightly more, not rejecting valid uploads.
+    """
+    if RATE_LIMIT_PER_MINUTE <= 0:
+        return False
+
+    window = int(time.time() // 60)
+    with _rate_lock:
+        if len(_rate_buckets) > 10000:
+            for key in [k for k in _rate_buckets if _rate_buckets[k][0] != window]:
+                _rate_buckets.pop(key, None)
+        current_window, count = _rate_buckets.get(client_key, (window, 0))
+        if current_window != window:
+            current_window, count = window, 0
+        count += 1
+        _rate_buckets[client_key] = (current_window, count)
+    return count > RATE_LIMIT_PER_MINUTE
+
+
 def _hash_row(row_dict: dict) -> str:
     """Deterministic SHA-256 hash of a row dict (sorted keys, stripped vals)."""
     canonical = json.dumps(
@@ -279,9 +358,13 @@ _REINFORCEMENT_KEY_MAP = {
     "Timestamp": "original_timestamp",
 }
 
+# Accepted payload key -> DB column. A tuple means "first key that carries a
+# value wins", which lets clients move to the accurate "Paper Text" name while
+# older clients keep working. The column keeps its original name; renaming it
+# would buy nothing and would need a migration.
 _ENTITY_KEY_MAP = {
     "Paper Title": "paper_title",
-    "Paper Text (truncated)": "paper_text_truncated",
+    ("Paper Text", "Paper Text (truncated)"): "paper_text_truncated",
     "GO ID": "go_id",
     "GO Name": "go_name",
     "GO Definition": "go_definition",
@@ -296,9 +379,24 @@ _ENTITY_KEY_MAP = {
 
 
 def _map_row(row: dict, key_map: dict) -> dict:
-    """Map incoming JSON row keys to DB column names."""
-    return {db_col: str(row.get(csv_key, "")).strip()
-            for csv_key, db_col in key_map.items()}
+    """
+    Map incoming JSON row keys to DB column names.
+
+    A key may be a tuple of accepted names; the first one present with a
+    non-empty value is used. Keys outside the map are ignored, so unexpected
+    fields can never reach the database.
+    """
+    mapped = {}
+    for csv_key, db_col in key_map.items():
+        names = csv_key if isinstance(csv_key, tuple) else (csv_key,)
+        value = ""
+        for name in names:
+            candidate = str(row.get(name, "") or "").strip()
+            if candidate:
+                value = candidate
+                break
+        mapped[db_col] = value
+    return mapped
 
 
 # ---------------------------------------------------------------------------
@@ -307,84 +405,112 @@ def _map_row(row: dict, key_map: dict) -> dict:
 @app.route("/collect", methods=["POST"])
 @require_api_key
 def collect():
-    try:
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"error": "Invalid JSON payload"}), 400
+    client_key = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if _rate_limited(client_key):
+        # Nothing is stored and nothing is acknowledged, so the client keeps
+        # every row pending and retries after the interval below.
+        return jsonify({
+            "error": "Too many requests",
+            "hint": "Rows were not stored. Retry after the interval in Retry-After.",
+        }), 429, {"Retry-After": str(RATE_LIMIT_RETRY_AFTER)}
 
-        installation_id = data.get("installation_id", "unknown")
-        rows_payload = data.get("rows", {})
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid JSON payload"}), 400
 
-        if not isinstance(rows_payload, dict):
-            return jsonify({"error": "'rows' must be a dict with keys 'reinforcement' and/or 'reinforcement_entity'"}), 400
+    installation_id = str(data.get("installation_id", "unknown"))[:128]
+    rows_payload = data.get("rows", {})
 
-        db = get_db()
-        result = {"inserted": {}, "duplicates_skipped": {}}
+    if not isinstance(rows_payload, dict):
+        return jsonify({"error": "'rows' must be a dict with keys 'reinforcement' and/or 'reinforcement_entity'"}), 400
 
-        # --- Reinforcement rows ---
-        reinf_rows = rows_payload.get("reinforcement", [])
-        inserted_r, dupes_r = 0, 0
-        for row in reinf_rows:
-            row_hash = _hash_row(row)
-            mapped = _map_row(row, _REINFORCEMENT_KEY_MAP)
-            mapped["row_hash"] = row_hash
-            mapped["installation_id"] = installation_id
+    reinf_in = rows_payload.get("reinforcement") or []
+    entity_in = rows_payload.get("reinforcement_entity") or []
+    if not isinstance(reinf_in, list) or not isinstance(entity_in, list):
+        return jsonify({"error": "'reinforcement' and 'reinforcement_entity' must be lists"}), 400
 
-            cols = ", ".join(mapped.keys())
-            placeholders = ", ".join(["?"] * len(mapped))
-            try:
-                changes = query_db(
-                    f"INSERT OR IGNORE INTO reinforcement_rows ({cols}) VALUES ({placeholders})",
-                    list(mapped.values()),
-                    commit=True
-                )
-                if changes and changes > 0:
-                    inserted_r += 1
-                else:
-                    dupes_r += 1
-            except Exception as e:
-                if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
-                    dupes_r += 1
-                else:
-                    return jsonify({"error": "Postgres Insert Error (Reinf)", "details": str(e), "trace": repr(e)}), 500
+    if len(reinf_in) + len(entity_in) > MAX_ROWS_PER_REQUEST:
+        # 413 rather than 400: the client splits the batch and retries.
+        return jsonify({
+            "error": "Too many rows in one request",
+            "max_rows": MAX_ROWS_PER_REQUEST,
+            "hint": "Split the batch and retry; no rows were stored.",
+        }), 413
 
-        result["inserted"]["reinforcement"] = inserted_r
-        result["duplicates_skipped"]["reinforcement"] = dupes_r
+    db = get_db()
+    result = {"inserted": {}, "duplicates_skipped": {}}
 
-        # --- Entity rows ---
-        entity_rows = rows_payload.get("reinforcement_entity", [])
-        inserted_e, dupes_e = 0, 0
-        for row in entity_rows:
-            row_hash = _hash_row(row)
-            mapped = _map_row(row, _ENTITY_KEY_MAP)
-            mapped["row_hash"] = row_hash
-            mapped["installation_id"] = installation_id
+    # --- Reinforcement rows ---
+    reinf_rows = reinf_in
+    inserted_r, dupes_r = 0, 0
+    for row in reinf_rows:
+        row_hash = _hash_row(row)
+        mapped = _map_row(row, _REINFORCEMENT_KEY_MAP)
+        mapped["row_hash"] = row_hash
+        mapped["installation_id"] = installation_id
 
-            cols = ", ".join(mapped.keys())
-            placeholders = ", ".join(["?"] * len(mapped))
-            try:
-                changes = query_db(
-                    f"INSERT OR IGNORE INTO reinforcement_entity_rows ({cols}) VALUES ({placeholders})",
-                    list(mapped.values()),
-                    commit=True
-                )
-                if changes and changes > 0:
-                    inserted_e += 1
-                else:
-                    dupes_e += 1
-            except Exception as e:
-                if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
-                    dupes_e += 1
-                else:
-                    return jsonify({"error": "Postgres Insert Error (Entity)", "details": str(e), "trace": repr(e)}), 500
+        cols = ", ".join(mapped.keys())
+        placeholders = ", ".join(["?"] * len(mapped))
+        try:
+            changes = query_db(
+                f"INSERT OR IGNORE INTO reinforcement_rows ({cols}) VALUES ({placeholders})",
+                list(mapped.values()),
+                commit=True
+            )
+            if changes and changes > 0:
+                inserted_r += 1
+            else:
+                dupes_r += 1
+        except Exception as e:
+            if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
+                dupes_r += 1
+            else:
+                # Log the detail; never return it. The client keeps its rows
+                # pending and retries.
+                app.logger.exception("Insert failed for reinforcement_rows")
+                return jsonify({
+                    "error": "Could not store reinforcement rows",
+                    "hint": "No rows from this batch were stored; retry later.",
+                }), 500
 
-        result["inserted"]["reinforcement_entity"] = inserted_e
-        result["duplicates_skipped"]["reinforcement_entity"] = dupes_e
+    result["inserted"]["reinforcement"] = inserted_r
+    result["duplicates_skipped"]["reinforcement"] = dupes_r
 
-        return jsonify({"status": "ok", **result}), 200
-        
-    except Exception as e:
-        return jsonify({"error": "Global crash", "details": str(e), "traceback": traceback.format_exc()}), 500
+    # --- Entity rows ---
+    entity_rows = entity_in
+    inserted_e, dupes_e = 0, 0
+    for row in entity_rows:
+        row_hash = _hash_row(row)
+        mapped = _map_row(row, _ENTITY_KEY_MAP)
+        mapped["row_hash"] = row_hash
+        mapped["installation_id"] = installation_id
+
+        cols = ", ".join(mapped.keys())
+        placeholders = ", ".join(["?"] * len(mapped))
+        try:
+            changes = query_db(
+                f"INSERT OR IGNORE INTO reinforcement_entity_rows ({cols}) VALUES ({placeholders})",
+                list(mapped.values()),
+                commit=True
+            )
+            if changes and changes > 0:
+                inserted_e += 1
+            else:
+                dupes_e += 1
+        except Exception as e:
+            if "UNIQUE" in str(e).upper() or "INTEGRITY" in str(e).upper():
+                dupes_e += 1
+            else:
+                app.logger.exception("Insert failed for reinforcement_entity_rows")
+                return jsonify({
+                    "error": "Could not store entity rows",
+                    "hint": "No rows from this batch were stored; retry later.",
+                }), 500
+
+    result["inserted"]["reinforcement_entity"] = inserted_e
+    result["duplicates_skipped"]["reinforcement_entity"] = dupes_e
+
+    return jsonify({"status": "ok", **result}), 200
 
 
 
