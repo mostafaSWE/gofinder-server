@@ -1,0 +1,13 @@
+# Collected feedback. The database is created automatically on first run and
+# must never be committed: this repository is public, and the file would carry
+# real user feedback including document text.
+data/
+*.db
+*.sqlite3
+
+# Local environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
